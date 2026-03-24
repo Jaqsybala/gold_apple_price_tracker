@@ -1,8 +1,7 @@
 FROM python:3.12-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    DB_PATH=/app/data/watches.db
+    PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
@@ -13,7 +12,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY pyproject.toml README.md ./
 COPY src ./src
 RUN pip install --no-cache-dir . \
-    && playwright install --with-deps chromium \
-    && mkdir -p /app/data
+    && playwright install --with-deps chromium
 
 CMD ["python", "-m", "goldapple_bot"]

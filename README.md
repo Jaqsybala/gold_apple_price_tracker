@@ -2,17 +2,19 @@
 
 Telegram-бот принимает ссылку на товар с [goldapple.kz](https://goldapple.kz), периодически проверяет цену и пишет в чат, если она стала ниже последней сохранённой.
 
+Данные хранятся в **PostgreSQL** (переменная **`DATABASE_URL`**).
+
 ## Структура проекта
 
 ```
 Python/
-├── pyproject.toml          # зависимости и метаданные пакета
+├── pyproject.toml
 ├── README.md
 ├── Dockerfile
+├── docker-compose.yml      # Postgres + бот одной командой
 ├── .env.example
-├── data/                   # SQLite по умолчанию (data/watches.db)
 └── src/
-    └── goldapple_bot/      # код приложения
+    └── goldapple_bot/
         ├── __main__.py     # точка входа: python -m goldapple_bot
         ├── bot.py
         ├── db.py
@@ -22,57 +24,73 @@ Python/
 ## Что нужно
 
 - Python 3.10+
+- **PostgreSQL** (локально, Docker или облако — Heroku Postgres и т.п.)
 - Токен бота от [@BotFather](https://t.me/BotFather)
 
 ## Установка
 
-Из корня проекта (папка `Python`):
+Из корня проекта:
 
 ```bash
 pip install -e .
 playwright install chromium
 ```
 
-## Запуск
+## Переменные окружения
 
-Рабочая директория — корень проекта (чтобы находились `data/` и `.env`).
+| Переменная | Обязательно | Описание |
+|------------|-------------|----------|
+| `TELEGRAM_BOT_TOKEN` | да | Токен бота |
+| `DATABASE_URL` | да | URI PostgreSQL: `postgresql://USER:PASSWORD@HOST:PORT/DBNAME`. Префикс `postgres://` (Heroku) поддерживается. |
+| `CHECK_INTERVAL_SECONDS` | нет | Интервал полного цикла проверки цен (по умолчанию `3600`). |
+| `LIST_PAGE_SIZE` | нет | Сколько товаров на одной странице в `/list` (по умолчанию `5`). |
+
+Пример `.env` в корне проекта — см. [`.env.example`](.env.example).
+
+## Запуск локально (Python)
+
+Подними Postgres (см. ниже Docker Compose или свой инстанс), затем:
 
 **Windows (PowerShell):**
 
 ```powershell
 $env:TELEGRAM_BOT_TOKEN="ваш_токен"
+$env:DATABASE_URL="postgresql://USER:PASSWORD@localhost:5432/DBNAME"
 python -m goldapple_bot
 ```
 
-Либо после установки пакета:
-
-```powershell
-goldapple-bot
-```
-
-**Linux/macOS:**
+**Linux/macOS / Git Bash:**
 
 ```bash
 export TELEGRAM_BOT_TOKEN="ваш_токен"
+export DATABASE_URL="postgresql://USER:PASSWORD@localhost:5432/DBNAME"
 python -m goldapple_bot
 ```
 
-Опционально:
+Подставьте те же `USER`, `PASSWORD` и `DBNAME`, что в `.env` для Postgres (см. [`.env.example`](.env.example)).
 
-- `CHECK_INTERVAL_SECONDS` — пауза между полными циклами проверки (по умолчанию `3600`, раз в час).
-- `DB_PATH` — путь к файлу SQLite (по умолчанию `data/watches.db` относительно текущей директории).
+Либо после `pip install -e .`: `goldapple-bot` (те же переменные окружения).
 
-Можно положить токен в файл `.env` в корне проекта:
+## Docker Compose (Postgres + бот)
 
+Скопируй [`.env.example`](.env.example) в `.env` и задай **`TELEGRAM_BOT_TOKEN`**, **`POSTGRES_PASSWORD`** (и при желании `POSTGRES_USER` / `POSTGRES_DB`). Пароль не должен попадать в репозиторий.
+
+Запуск:
+
+```bash
+docker compose up --build
 ```
-TELEGRAM_BOT_TOKEN=ваш_токен
-```
 
-## Docker
+Postgres доступен на `localhost:5432` с учётными данными из `.env`. Данные в томе `pgdata`.
+
+## Только образ бота (свой Postgres)
 
 ```bash
 docker build -t goldapple-bot .
-docker run --rm -e TELEGRAM_BOT_TOKEN="ваш_токен" -v goldapple-data:/app/data goldapple-bot
+docker run --rm \
+  -e TELEGRAM_BOT_TOKEN="ваш_токен" \
+  -e DATABASE_URL="postgresql://USER:PASSWORD@host:5432/DBNAME" \
+  goldapple-bot
 ```
 
 ## Команды в Telegram
@@ -88,10 +106,6 @@ docker run --rm -e TELEGRAM_BOT_TOKEN="ваш_токен" -v goldapple-data:/app
 
 Если сайт изменит вёрстку, парсер может потребовать правки в `src/goldapple_bot/price_fetcher.py`.
 
-## Ошибка `database is locked`
-
-Закройте файл `data/watches.db` во внешних программах (DB Browser, второй запущенный экземпляр бота). Если папка проекта на **OneDrive** / в облаке, лучше перенесите проект или задайте `DB_PATH` на локальный диск. В коде включены ожидание блокировки (до ~30 с) и режим WAL для SQLite.
-
 ## Git Bash на Windows
 
-Токен задаётся так: `export TELEGRAM_BOT_TOKEN="..."` (не `env:...`, это синтаксис PowerShell).
+Токен: `export TELEGRAM_BOT_TOKEN="..."` (не `env:...`, это синтаксис PowerShell).

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -30,11 +31,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DB_PATH = Path(os.environ.get("DB_PATH", "data/watches.db"))
 CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "3600"))
+LIST_PAGE_SIZE = max(1, int(os.environ.get("LIST_PAGE_SIZE", "5")))
 
 BTN_MY_LIST = "📋 Мой список"
 BTN_HELP = "❓ Как пользоваться"
+EMPTY_WATCH_LIST_TEXT = "Пока ничего не отслеживается. Пришли ссылку на товар."
+CALLBACK_BAD_BUTTON = "Некорректная кнопка."
 
 HELP_TEXT = (
     "Пришли ссылку на товар с goldapple.kz — буду проверять цену и "
@@ -53,26 +56,64 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def _watch_list_lines(rows: list[dict]) -> list[str]:
-    lines = []
-    for r in rows:
-        title = (r.get("title") or "").strip()
-        short = (title[:50] + "…") if len(title) > 50 else title
-        extra = f" — {short}" if short else ""
-        lines.append(f"{r['id']}. {r['last_price']:,} ₸{extra}\n{r['url']}")
-    return lines
+def _watch_list_line_compact(r: dict) -> str:
+    title = (r.get("title") or "").strip()
+    short = (title[:48] + "…") if len(title) > 48 else title
+    extra = f" — {short}" if short else ""
+    return f"{r['id']}. {r['last_price']:,} ₸{extra}"
 
 
-def list_inline_keyboard(rows: list[dict]) -> InlineKeyboardMarkup:
-    keyboard = []
-    for r in rows:
+def build_watch_list_page(rows: list[dict], page: int) -> tuple[str, InlineKeyboardMarkup, int]:
+    """Текст, клавиатура и индекс страницы (0-based) после нормализации."""
+    total = len(rows)
+    pages = max(1, (total + LIST_PAGE_SIZE - 1) // LIST_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    start = page * LIST_PAGE_SIZE
+    chunk = rows[start : start + LIST_PAGE_SIZE]
+
+    header = f"Отслеживание — стр. {page + 1}/{pages}\n\n"
+    body = "\n\n".join(_watch_list_line_compact(r) for r in chunk)
+    text = header + body + "\n\nСсылки — кнопки «Сайт» ниже."
+
+    keyboard: list[list[InlineKeyboardButton]] = []
+    for r in chunk:
         keyboard.append(
             [
-                InlineKeyboardButton("Открыть на сайте", url=r["url"]),
-                InlineKeyboardButton("Удалить", callback_data=f"del:{r['id']}"),
+                InlineKeyboardButton("🌐 Сайт", url=r["url"]),
+                InlineKeyboardButton("🗑 Удалить", callback_data=f"delp:{r['id']}:{page}"),
             ]
         )
-    return InlineKeyboardMarkup(keyboard)
+    if pages > 1:
+        nav: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀️ Назад", callback_data=f"listpg:{page - 1}"))
+        nav.append(InlineKeyboardButton(f"· {page + 1}/{pages} ·", callback_data="listpg:noop"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("Вперёд ▶️", callback_data=f"listpg:{page + 1}"))
+        keyboard.append(nav)
+
+    return text, InlineKeyboardMarkup(keyboard), page
+
+
+_LISTPG_RE = re.compile(r"^listpg:(\d+)$")
+
+
+async def send_watch_list_paginated(message, chat_id: int, page: int = 0) -> None:
+    rows = db.list_watches_for_chat(chat_id)
+    if not rows:
+        await message.reply_text(EMPTY_WATCH_LIST_TEXT, reply_markup=main_reply_keyboard())
+        return
+    text, kb, _ = build_watch_list_page(rows, page)
+    await message.reply_text(text, reply_markup=kb, disable_web_page_preview=True)
+
+
+async def edit_watch_list_paginated(query, chat_id: int, page: int) -> None:
+    rows = db.list_watches_for_chat(chat_id)
+    if not rows:
+        await query.message.edit_text(EMPTY_WATCH_LIST_TEXT, reply_markup=None)
+        return
+    text, kb, _ = build_watch_list_page(rows, page)
+    await query.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
 
 
 def after_watch_inline(watch_id: int) -> InlineKeyboardMarkup:
@@ -89,15 +130,7 @@ def invalid_input_inline() -> InlineKeyboardMarkup:
 
 
 async def reply_watch_list(message, chat_id: int) -> None:
-    rows = db.list_watches_for_chat(DB_PATH, chat_id)
-    if not rows:
-        await message.reply_text(
-            "Пока ничего не отслеживается. Пришли ссылку на товар.",
-            reply_markup=main_reply_keyboard(),
-        )
-        return
-    body = "\n\n".join(_watch_list_lines(rows))
-    await message.reply_text(body, reply_markup=list_inline_keyboard(rows))
+    await send_watch_list_paginated(message, chat_id, page=0)
 
 
 async def post_init(application: Application) -> None:
@@ -109,11 +142,11 @@ async def post_init(application: Application) -> None:
             BotCommand("help", "Как пользоваться"),
         ]
     )
-    db.init_db(DB_PATH)
+    db.init_db()
     application.bot_data["_price_poll_task"] = asyncio.create_task(
         price_poll_loop(application)
     )
-    logger.info("DB ready at %s, poll every %s s", DB_PATH.resolve(), CHECK_INTERVAL_SECONDS)
+    logger.info("DB: PostgreSQL, poll every %s s", CHECK_INTERVAL_SECONDS)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -128,6 +161,57 @@ async def list_watches_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await reply_watch_list(update.effective_message, update.effective_chat.id)
 
 
+async def _callback_list_page_nav(query, page: int) -> None:
+    await query.answer()
+    try:
+        await edit_watch_list_paginated(query, query.message.chat.id, page)
+    except Exception:
+        logger.exception("edit_watch_list_paginated")
+
+
+async def _callback_del_alert_or_card(query, wid: int) -> None:
+    ok = db.delete_watch(query.message.chat.id, wid)
+    if ok:
+        await query.answer("Убрала из отслеживания.")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            logger.exception("edit_message_reply_markup after delete")
+    else:
+        await query.answer("Этой записи уже нет.", show_alert=True)
+
+
+async def _callback_del_from_list(query, data: str) -> None:
+    parts = data.split(":")
+    if len(parts) != 3:
+        await query.answer(CALLBACK_BAD_BUTTON, show_alert=True)
+        return
+    try:
+        wid = int(parts[1])
+        page = int(parts[2])
+    except ValueError:
+        await query.answer(CALLBACK_BAD_BUTTON, show_alert=True)
+        return
+    chat_id = query.message.chat.id
+    if not db.delete_watch(chat_id, wid):
+        await query.answer("Этой записи уже нет.", show_alert=True)
+        return
+    await query.answer("Убрала из отслеживания.")
+    rows = db.list_watches_for_chat(chat_id)
+    if not rows:
+        try:
+            await query.message.edit_text(EMPTY_WATCH_LIST_TEXT, reply_markup=None)
+        except Exception:
+            logger.exception("edit_message after delp empty list")
+        return
+    pages = max(1, (len(rows) + LIST_PAGE_SIZE - 1) // LIST_PAGE_SIZE)
+    page = min(page, pages - 1)
+    try:
+        await edit_watch_list_paginated(query, chat_id, page)
+    except Exception:
+        logger.exception("edit_watch_list_paginated after delp")
+
+
 async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         await update.effective_message.reply_text("Например: /remove 2 (номер из /list)")
@@ -137,7 +221,7 @@ async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     except ValueError:
         await update.effective_message.reply_text("Номер должен быть числом.")
         return
-    if db.delete_watch(DB_PATH, update.effective_chat.id, wid):
+    if db.delete_watch(update.effective_chat.id, wid):
         await update.effective_message.reply_text("Убрал из отслеживания.")
     else:
         await update.effective_message.reply_text("Такой записи нет.")
@@ -149,21 +233,26 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     data = query.data or ""
 
+    if data == "listpg:noop":
+        await query.answer()
+        return
+
+    m = _LISTPG_RE.match(data)
+    if m:
+        await _callback_list_page_nav(query, int(m.group(1)))
+        return
+
+    if data.startswith("delp:"):
+        await _callback_del_from_list(query, data)
+        return
+
     if data.startswith("del:"):
         try:
             wid = int(data.split(":", 1)[1])
         except ValueError:
-            await query.answer("Некорректная кнопка.", show_alert=True)
+            await query.answer(CALLBACK_BAD_BUTTON, show_alert=True)
             return
-        ok = db.delete_watch(DB_PATH, query.message.chat.id, wid)
-        if ok:
-            await query.answer("Убрала из отслеживания.")
-            try:
-                await query.edit_message_reply_markup(reply_markup=None)
-            except Exception:
-                logger.exception("edit_message_reply_markup after delete")
-        else:
-            await query.answer("Этой записи уже нет.", show_alert=True)
+        await _callback_del_alert_or_card(query, wid)
         return
 
     if data == "nav:list":
@@ -203,7 +292,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text(err or "Не удалось получить цену.")
         return
 
-    created, wid = db.add_watch(DB_PATH, update.effective_chat.id, url, price, title)
+    created, wid = db.add_watch(update.effective_chat.id, url, price, title)
     if wid is None:
         await update.effective_message.reply_text("Не удалось сохранить отслеживание.")
         return
@@ -248,7 +337,7 @@ async def _poll_one_watch(bot: Bot, row: dict) -> None:
             )
         except Exception:
             logger.exception("send_message chat_id=%s", chat_id)
-    db.update_watch_price(DB_PATH, int(row["id"]), price, title)
+    db.update_watch_price(int(row["id"]), price, title)
 
 
 async def price_poll_loop(application: Application) -> None:
@@ -256,7 +345,7 @@ async def price_poll_loop(application: Application) -> None:
     bot = application.bot
     while True:
         try:
-            rows = db.all_watches(DB_PATH)
+            rows = db.all_watches()
             for row in rows:
                 await _poll_one_watch(bot, row)
         except Exception:
@@ -268,6 +357,10 @@ def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise SystemExit("Задайте переменную окружения TELEGRAM_BOT_TOKEN")
+    try:
+        db.require_database_url()
+    except RuntimeError as e:
+        raise SystemExit(str(e)) from e
 
     application = (
         Application.builder()
