@@ -15,17 +15,33 @@ META_PRICE_RE = re.compile(
 )
 
 
+# Останавливаемся перед следующей ссылкой на тот же домен (часто вставляют подряд без пробела).
+_GA_URL_RE = re.compile(
+    r"https?://goldapple\.kz/.+?(?=https?://goldapple\.kz|\s|$)",
+    re.IGNORECASE,
+)
+
+
+def extract_all_goldapple_kz_urls(text: str) -> list[str]:
+    """Все уникальные https://goldapple.kz/... из текста, порядок появления."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in _GA_URL_RE.finditer(text):
+        raw = m.group(0).rstrip(").,;]")
+        parsed = urlparse(raw)
+        if parsed.netloc.lower() != ALLOWED_NETLOC or not parsed.path or parsed.path == "/":
+            continue
+        norm = f"https://{ALLOWED_NETLOC}{parsed.path}"
+        if norm not in seen:
+            seen.add(norm)
+            out.append(norm)
+    return out
+
+
 def normalize_goldapple_kz_url(text: str) -> str | None:
-    """Extract first https://goldapple.kz/... URL from text, or None."""
-    m = re.search(r"https?://goldapple\.kz/[^\s]+", text, re.IGNORECASE)
-    if not m:
-        return None
-    raw = m.group(0).rstrip(").,;]")
-    parsed = urlparse(raw)
-    if parsed.netloc.lower() != ALLOWED_NETLOC or not parsed.path or parsed.path == "/":
-        return None
-    # Normalize to https without fragment
-    return f"https://{ALLOWED_NETLOC}{parsed.path}"
+    """Первая ссылка goldapple.kz из текста, или None."""
+    urls = extract_all_goldapple_kz_urls(text)
+    return urls[0] if urls else None
 
 
 def _prices_from_meta_html(html: str) -> list[int]:
