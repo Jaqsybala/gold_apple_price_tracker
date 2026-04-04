@@ -27,6 +27,8 @@ services:
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      # Снижает сбои Node (драйвер Playwright) в Docker: uv_thread_create / libuv + io_uring
+      UV_USE_IO_URING: "0"
 
 volumes:
   pgdata: {}

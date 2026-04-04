@@ -1,8 +1,11 @@
-"""Fetch product price from goldapple.kz using Playwright."""
+"""Fetch product price from goldapple.kz (HTTP first, Playwright fallback)."""
 
 from __future__ import annotations
 
+import asyncio
 import re
+import urllib.error
+import urllib.request
 from urllib.parse import urlparse
 
 from playwright.async_api import async_playwright
@@ -13,6 +16,7 @@ META_PRICE_RE = re.compile(
     r'<meta\s+itemprop="price"\s+content="(\d+)"',
     re.IGNORECASE,
 )
+TITLE_RE = re.compile(r"<title[^>]*>([^<]*)</title>", re.IGNORECASE)
 
 
 # Останавливаемся перед следующей ссылкой на тот же домен (часто вставляют подряд без пробела).
@@ -49,6 +53,27 @@ def _prices_from_meta_html(html: str) -> list[int]:
     return [n for n in found if n > 0]
 
 
+def _http_get_html(url: str, *, timeout_s: float = 30.0) -> str | None:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            charset = resp.headers.get_content_charset() or "utf-8"
+            return resp.read().decode(charset, errors="replace")
+    except (urllib.error.URLError, TimeoutError):
+        return None
+
+
 async def fetch_price_kz(url: str, *, timeout_ms: int = 90_000) -> tuple[int | None, str | None, str | None]:
     """
     Load product page and return (price_kzt, title, error).
@@ -59,6 +84,15 @@ async def fetch_price_kz(url: str, *, timeout_ms: int = 90_000) -> tuple[int | N
     parsed = urlparse(url)
     if parsed.netloc.lower() != ALLOWED_NETLOC or not url.lower().startswith("https://"):
         return None, None, "Разрешены только ссылки https://goldapple.kz/..."
+
+    timeout_s = max(timeout_ms / 1000.0, 5.0)
+    html = await asyncio.to_thread(_http_get_html, url, timeout_s=timeout_s)
+    if html:
+        prices = list(dict.fromkeys(_prices_from_meta_html(html)))
+        if prices:
+            tm = TITLE_RE.search(html)
+            title = (tm.group(1).strip() if tm else None) or None
+            return min(prices), title, None
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)

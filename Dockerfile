@@ -1,7 +1,8 @@
 FROM python:3.12-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    UV_USE_IO_URING=0
 
 WORKDIR /app
 
