@@ -86,45 +86,64 @@ async def fetch_price_kz(url: str, *, timeout_ms: int = 90_000) -> tuple[int | N
         return None, None, "Разрешены только ссылки https://goldapple.kz/..."
 
     timeout_s = max(timeout_ms / 1000.0, 5.0)
-    html = await asyncio.to_thread(_http_get_html, url, timeout_s=timeout_s)
-    if html:
-        prices = list(dict.fromkeys(_prices_from_meta_html(html)))
-        if prices:
-            tm = TITLE_RE.search(html)
-            title = (tm.group(1).strip() if tm else None) or None
-            return min(prices), title, None
+    # HTTP + Playwright подряд; без верхней границы зависание держит lock в боте и блокирует чат.
+    overall_cap = max(120.0, 2.0 * timeout_s + 45.0)
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        try:
-            page = await browser.new_page()
+    async def _run() -> tuple[int | None, str | None, str | None]:
+        html = await asyncio.to_thread(_http_get_html, url, timeout_s=timeout_s)
+        if html:
+            prices = list(dict.fromkeys(_prices_from_meta_html(html)))
+            if prices:
+                tm = TITLE_RE.search(html)
+                title = (tm.group(1).strip() if tm else None) or None
+                return min(prices), title, None
+
+        async with async_playwright() as p:
+            launch_timeout = min(timeout_ms, 120_000)
+            browser = await p.chromium.launch(
+                headless=True,
+                timeout=launch_timeout,
+            )
             try:
-                await page.goto(url, wait_until="networkidle", timeout=timeout_ms)
-            except PlaywrightTimeout:
-                return None, None, "Таймаут загрузки страницы"
-            await page.wait_for_timeout(2500)
+                page = await browser.new_page()
+                try:
+                    # networkidle на тяжёлых витринах часто не наступает → зависание до ручного стопа.
+                    await page.goto(url, wait_until="load", timeout=timeout_ms)
+                except PlaywrightTimeout:
+                    return None, None, "Таймаут загрузки страницы"
+                await page.wait_for_timeout(2500)
 
-            title = (await page.title()).strip() or None
+                title = (await page.title()).strip() or None
 
-            prices = await page.evaluate(
-                """() => {
+                prices = await page.evaluate(
+                    """() => {
                   const metas = [...document.querySelectorAll('meta[itemprop="price"]')];
                   const nums = metas
                     .map(m => parseInt(m.getAttribute('content') || '0', 10))
                     .filter(n => n > 0);
                   return [...new Set(nums)];
                 }"""
-            )
+                )
 
-            if not prices:
-                html = await page.content()
-                prices = list(dict.fromkeys(_prices_from_meta_html(html)))
+                if not prices:
+                    html2 = await page.content()
+                    prices = list(dict.fromkeys(_prices_from_meta_html(html2)))
 
-            if not prices:
-                return None, title, "Не удалось найти цену на странице (сайт мог измениться)"
+                if not prices:
+                    return None, title, "Не удалось найти цену на странице (сайт мог измениться)"
 
-            return min(prices), title, None
-        except Exception as e:
-            return None, None, f"Ошибка: {e}"
-        finally:
-            await browser.close()
+                return min(prices), title, None
+            except Exception as e:
+                return None, None, f"Ошибка: {e}"
+            finally:
+                await browser.close()
+
+    try:
+        return await asyncio.wait_for(_run(), timeout=overall_cap)
+    except asyncio.TimeoutError:
+        return (
+            None,
+            None,
+            "Сайт не ответил в разумный срок — запрос прерван. "
+            "Попробуй снова или перезапусти бота, если зависание повторяется.",
+        )
