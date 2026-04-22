@@ -21,6 +21,8 @@ services:
   bot:
     container_name: goldapple-bot
     build: .
+    shm_size: "1gb"
+    init: true
     depends_on:
       postgres:
         condition: service_healthy

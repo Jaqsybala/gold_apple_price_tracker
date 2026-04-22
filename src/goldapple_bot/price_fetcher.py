@@ -100,10 +100,23 @@ async def fetch_price_kz(url: str, *, timeout_ms: int = 90_000) -> tuple[int | N
 
         async with async_playwright() as p:
             launch_timeout = min(timeout_ms, 120_000)
-            browser = await p.chromium.launch(
-                headless=True,
-                timeout=launch_timeout,
-            )
+            browser = None
+            for attempt in range(3):
+                try:
+                    browser = await p.chromium.launch(
+                        headless=True,
+                        timeout=launch_timeout,
+                    )
+                    break
+                except Exception as e:
+                    retryable = type(e).__name__ == "TargetClosedError" or (
+                        "Target page, context or browser has been closed" in str(e)
+                    )
+                    if retryable and attempt < 2:
+                        await asyncio.sleep(1.0 * (attempt + 1))
+                        continue
+                    return None, None, f"Ошибка: {e}"
+            assert browser is not None
             try:
                 page = await browser.new_page()
                 try:
