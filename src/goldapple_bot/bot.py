@@ -17,11 +17,15 @@ if __name__ == "__main__":
         sys.path.insert(0, _src_s)
 
 from dotenv import load_dotenv
-from telegram import Bot, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, Update
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from goldapple_bot import db
-from goldapple_bot.price_fetcher import extract_all_goldapple_kz_urls, fetch_price_kz
+from goldapple_bot.price_fetcher import (
+    extract_all_goldapple_kz_urls,
+    fetch_price_kz,
+    shutdown_playwright,
+)
 
 load_dotenv()
 
@@ -49,12 +53,8 @@ SEARCH_PROMPT_TEXT = (
 HELP_TEXT = (
     "Пришли ссылку на товар с goldapple.kz — буду проверять цену и "
     "напишу, если она станет ниже.\n\n"
-    "Кнопки внизу экрана — как на подписи: «📋 Мой список», «🔍 Поиск в списке», "
+    "Кнопки внизу экрана: «📋 Мой список», «🔍 Поиск в списке», "
     "«❓ Как пользоваться». В списке и уведомлениях — «Открыть» и «Удалить».\n\n"
-    "Команды (как в меню слева от поля ввода):\n"
-    "/list — что отслеживается\n"
-    "/search — режим поиска по списку\n"
-    "/remove N — убрать N-й пункт (номер как в /list)\n\n"
     "Поиск: несколько слов через пробел — все должны встретиться в названии или ссылке. "
     "Если совпадений много — листай страницы.\n\n"
     "Можно прислать несколько ссылок в одном сообщении — обработаю по очереди.\n\n"
@@ -306,20 +306,23 @@ async def handle_search_query(
 
 
 async def post_init(application: Application) -> None:
-    await application.bot.set_my_commands(
-        [
-            BotCommand("start", "Начать"),
-            BotCommand("list", "Что отслеживается"),
-            BotCommand("search", "Поиск по своему списку"),
-            BotCommand("remove", "Убрать по номеру строки из /list"),
-            BotCommand("help", "Как пользоваться"),
-        ]
-    )
+    await application.bot.delete_my_commands()
     db.init_db()
     application.bot_data["_price_poll_task"] = asyncio.create_task(
         price_poll_loop(application)
     )
     logger.info("DB: PostgreSQL, poll every %s s", CHECK_INTERVAL_SECONDS)
+
+
+async def post_shutdown(application: Application) -> None:
+    t = application.bot_data.get("_price_poll_task")
+    if t is not None:
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+    await shutdown_playwright()
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -498,7 +501,7 @@ async def _callback_del_from_list(query, data: str) -> None:
 async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         await update.effective_message.reply_text(
-            "Например: /remove 2 — убирает вторую строку из списка /list."
+            "Например: /remove 2 — убирает вторую строку из списка (как в «Мой список»)."
         )
         return
     try:
@@ -743,6 +746,7 @@ def main() -> None:
         .token(token)
         .concurrent_updates(True)
         .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
     application.add_handler(CallbackQueryHandler(on_callback))

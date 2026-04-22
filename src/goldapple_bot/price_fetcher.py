@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import urllib.error
 import urllib.request
 from urllib.parse import urlparse
 
-from playwright.async_api import async_playwright
+from playwright.async_api import Browser, Playwright, async_playwright
 from playwright.async_api import TimeoutError as PlaywrightTimeout
 
 ALLOWED_NETLOC = "goldapple.kz"
@@ -18,6 +19,21 @@ META_PRICE_RE = re.compile(
 )
 TITLE_RE = re.compile(r"<title[^>]*>([^<]*)</title>", re.IGNORECASE)
 
+_playwright: Playwright | None = None
+_browser: Browser | None = None
+_browser_state_lock = asyncio.Lock()
+
+
+def _parse_max_playwright_contexts() -> int:
+    """Одновременные вкладки (new_context) в одном Chromium; ограничивает RAM на маленьком VPS."""
+    try:
+        n = int(os.environ.get("PLAYWRIGHT_MAX_CONTEXTS", "4").strip())
+    except ValueError:
+        n = 4
+    return max(1, min(n, 16))
+
+
+_pw_context_semaphore = asyncio.Semaphore(_parse_max_playwright_contexts())
 
 # Останавливаемся перед следующей ссылкой на тот же домен (часто вставляют подряд без пробела).
 _GA_URL_RE = re.compile(
@@ -74,53 +90,84 @@ def _http_get_html(url: str, *, timeout_s: float = 30.0) -> str | None:
         return None
 
 
-async def fetch_price_kz(url: str, *, timeout_ms: int = 90_000) -> tuple[int | None, str | None, str | None]:
-    """
-    Load product page and return (price_kzt, title, error).
+def _playwright_transient_error(exc: BaseException) -> bool:
+    name = type(exc).__name__
+    if name == "TargetClosedError":
+        return True
+    msg = str(exc)
+    return "Target page, context or browser has been closed" in msg
 
-    Current sale price is the minimum of all positive schema.org price metas
-    (strikethrough RRP and current price are both present when discounted).
-    """
-    parsed = urlparse(url)
-    if parsed.netloc.lower() != ALLOWED_NETLOC or not url.lower().startswith("https://"):
-        return None, None, "Разрешены только ссылки https://goldapple.kz/..."
 
-    timeout_s = max(timeout_ms / 1000.0, 5.0)
-    # HTTP + Playwright подряд; без верхней границы зависание держит lock в боте и блокирует чат.
-    overall_cap = max(120.0, 2.0 * timeout_s + 45.0)
+async def _close_browser_unsafe() -> None:
+    global _browser
+    if _browser is not None:
+        try:
+            await _browser.close()
+        except Exception:
+            pass
+        _browser = None
 
-    async def _run() -> tuple[int | None, str | None, str | None]:
-        html = await asyncio.to_thread(_http_get_html, url, timeout_s=timeout_s)
-        if html:
-            prices = list(dict.fromkeys(_prices_from_meta_html(html)))
-            if prices:
-                tm = TITLE_RE.search(html)
-                title = (tm.group(1).strip() if tm else None) or None
-                return min(prices), title, None
 
-        async with async_playwright() as p:
-            launch_timeout = min(timeout_ms, 120_000)
-            browser = None
-            for attempt in range(3):
-                try:
-                    browser = await p.chromium.launch(
-                        headless=True,
-                        timeout=launch_timeout,
-                    )
-                    break
-                except Exception as e:
-                    retryable = type(e).__name__ == "TargetClosedError" or (
-                        "Target page, context or browser has been closed" in str(e)
-                    )
-                    if retryable and attempt < 2:
-                        await asyncio.sleep(1.0 * (attempt + 1))
-                        continue
-                    return None, None, f"Ошибка: {e}"
-            assert browser is not None
+async def _teardown_playwright_unsafe() -> None:
+    global _playwright, _browser
+    await _close_browser_unsafe()
+    if _playwright is not None:
+        try:
+            await _playwright.stop()
+        except Exception:
+            pass
+        _playwright = None
+
+
+async def shutdown_playwright() -> None:
+    """Закрыть общий Chromium (вызывать из post_shutdown бота)."""
+    async with _browser_state_lock:
+        await _teardown_playwright_unsafe()
+
+
+async def _ensure_browser(launch_timeout_ms: int) -> Browser:
+    global _playwright, _browser
+    async with _browser_state_lock:
+        if _browser is not None and _browser.is_connected():
+            return _browser
+        await _close_browser_unsafe()
+        if _playwright is None:
+            _playwright = await async_playwright().start()
+        last_exc: BaseException | None = None
+        for attempt in range(3):
             try:
-                page = await browser.new_page()
+                _browser = await _playwright.chromium.launch(
+                    headless=True,
+                    timeout=launch_timeout_ms,
+                )
+                return _browser
+            except Exception as e:
+                last_exc = e
+                if _playwright_transient_error(e) and attempt < 2:
+                    await asyncio.sleep(1.0 * (attempt + 1))
+                    continue
+                await _teardown_playwright_unsafe()
+                break
+        assert last_exc is not None
+        raise last_exc
+
+
+async def _invalidate_shared_browser() -> None:
+    async with _browser_state_lock:
+        await _close_browser_unsafe()
+
+
+async def _playwright_tab_fetch(
+    url: str, timeout_ms: int, launch_timeout_ms: int
+) -> tuple[int | None, str | None, str | None]:
+    async with _pw_context_semaphore:
+        for attempt in range(2):
+            context = None
+            try:
+                browser = await _ensure_browser(launch_timeout_ms)
+                context = await browser.new_context()
+                page = await context.new_page()
                 try:
-                    # networkidle на тяжёлых витринах часто не наступает → зависание до ручного стопа.
                     await page.goto(url, wait_until="load", timeout=timeout_ms)
                 except PlaywrightTimeout:
                     return None, None, "Таймаут загрузки страницы"
@@ -147,9 +194,48 @@ async def fetch_price_kz(url: str, *, timeout_ms: int = 90_000) -> tuple[int | N
 
                 return min(prices), title, None
             except Exception as e:
+                if _playwright_transient_error(e) and attempt == 0:
+                    await _invalidate_shared_browser()
+                    continue
                 return None, None, f"Ошибка: {e}"
             finally:
-                await browser.close()
+                if context is not None:
+                    try:
+                        await context.close()
+                    except Exception:
+                        pass
+    return None, None, "Ошибка: не удалось открыть браузер"
+
+
+async def fetch_price_kz(url: str, *, timeout_ms: int = 90_000) -> tuple[int | None, str | None, str | None]:
+    """
+    Load product page and return (price_kzt, title, error).
+
+    Current sale price is the minimum of all positive schema.org price metas
+    (strikethrough RRP and current price are both present when discounted).
+    """
+    parsed = urlparse(url)
+    if parsed.netloc.lower() != ALLOWED_NETLOC or not url.lower().startswith("https://"):
+        return None, None, "Разрешены только ссылки https://goldapple.kz/..."
+
+    timeout_s = max(timeout_ms / 1000.0, 5.0)
+    # HTTP + Playwright подряд; без верхней границы зависание держит lock в боте и блокирует чат.
+    overall_cap = max(120.0, 2.0 * timeout_s + 45.0)
+    launch_timeout_ms = min(timeout_ms, 120_000)
+
+    async def _run() -> tuple[int | None, str | None, str | None]:
+        html = await asyncio.to_thread(_http_get_html, url, timeout_s=timeout_s)
+        if html:
+            prices = list(dict.fromkeys(_prices_from_meta_html(html)))
+            if prices:
+                tm = TITLE_RE.search(html)
+                title = (tm.group(1).strip() if tm else None) or None
+                return min(prices), title, None
+
+        try:
+            return await _playwright_tab_fetch(url, timeout_ms, launch_timeout_ms)
+        except Exception as e:
+            return None, None, f"Ошибка: {e}"
 
     try:
         return await asyncio.wait_for(_run(), timeout=overall_cap)
